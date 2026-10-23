@@ -1,0 +1,29 @@
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -77,6 +77,26 @@
+      "     'IOProviderClass' = IOResources;"
+      "     'IOMatchCategory' = SweetHIDTouch;"
+      "   },"
++#if defined(ARM64_BOARD_CONFIG_ALIOTH)
++    "   {"
++    "     'IOClass'         = AliothHIDButtons;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AliothHIDButtons;"
++    "   },"
++    "   {"
++    "     'IOClass'         = AliothHIDTouch;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AliothHIDTouch;"
++    "   },"
++#endif
++#if defined(ARM64_BOARD_CONFIG_ALIOTH)
++    "   {"
++    "     'IOClass'         = AliothSurfaceRoot;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AliothSurfaceRoot;"
++    "   },"
++#endif
+ #endif
+      "   {"
+      "     'IOClass'         = IOPanicPlatform;"

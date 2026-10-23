@@ -1,0 +1,233 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@
+ bsd/dev/alioth_rpmh.c			standard
+ bsd/dev/alioth_spmi.c			standard
+ bsd/dev/alioth_battery.c		standard
++bsd/dev/alioth_console_log.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -50,6 +50,7 @@
+ extern void alioth_keys_init(void);
+ extern void alioth_touch_init(void);
+ extern void alioth_rpmh_init(void);
++extern void alioth_console_log_init(void);
+ extern void alioth_spmi_init(void);
+ extern void alioth_battery_init(void);
+
+@@ -607,6 +608,7 @@
+ 	alioth_keys_init();
+ 	alioth_touch_init();
+ 	alioth_rpmh_init();
++	alioth_console_log_init();
+ 	alioth_spmi_init();
+ 	alioth_battery_init();
+ 	return 0;
+ }
+--- /dev/null
++++ b/bsd/dev/alioth_console_log.c
+@@ -0,0 +1,280 @@
++/*
++ * ALIOTH persistent console log to UFS partition.
++ * Writes kernel log to /private/var/log/kernel.log on the root filesystem.
++ * Based on sweet_console_log.c with alioth adjustments.
++ */
++#if defined(ARM64_BOARD_CONFIG_ALIOTH)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/kernel.h>
++#include <sys/mount.h>
++#include <sys/vnode.h>
++#include <sys/fcntl.h>
++#include <sys/uio.h>
++#include <sys/conf.h>
++#include <sys/vnode_if.h>
++#include <sys/file_internal.h>
++#include <kern/thread.h>
++#include <kern/locks.h>
++#include <kern/sched_prim.h>
++#include <vm/vm_map.h>
++#include <vm/vm_page.h>
++#include <vm/pmap.h>
++
++void alioth_console_log_init(void);
++extern void sweet_console_log_write(const char *buf, int len);
++
++/* Ring buffer for early boot messages before rootfs is mounted */
++#define LOG_RING_SIZE (64 * 1024)
++static char log_ring[LOG_RING_SIZE];
++static int log_ring_head = 0;
++static int log_ring_len = 0;
++static bool log_root_mounted = false;
++static vnode_t log_vp = NULL;
++static lck_mtx_t *log_lock = NULL;
++static thread_t log_thread = NULL;
++static char *log_path = "/private/var/log/kernel.log";
++
++static inline void
++log_ring_write(const char *buf, int len)
++{
++	if (len <= 0) return;
++	if (len > LOG_RING_SIZE) {
++		buf += len - LOG_RING_SIZE;
++		len = LOG_RING_SIZE;
++	}
++	int space = LOG_RING_SIZE - log_ring_len;
++	if (len <= space) {
++		memcpy(log_ring + log_ring_head, buf, len);
++		log_ring_head = (log_ring_head + len) % LOG_RING_SIZE;
++		log_ring_len += len;
++	} else {
++		/* Ring overflow: discard oldest */
++		int first = LOG_RING_SIZE - log_ring_head;
++		if (first > len) first = len;
++		memcpy(log_ring + log_ring_head, buf, first);
++		memcpy(log_ring, buf + first, len - first);
++		log_ring_head = (log_ring_head + len) % LOG_RING_SIZE;
++	}
++}
++
++static int
++log_vnode_open(void)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	int error;
++	struct nameidata nd;
++	NDINIT(&nd, LOOKUP, FOLLOW | WANTPARENT, UIO_SYSSPACE, log_path, ctx);
++	error = nameiat(&nd, NULL);
++	if (error == 0) {
++		/* File exists, open it */
++		nd.ni_cnd.cn_nameiop = OPEN;
++		nd.ni_cnd.cn_flags = FWRITE | O_APPEND;
++		error = nameiat(&nd, &log_vp);
++		nameidone(&nd);
++	} else if (error == ENOENT) {
++		/* Create it */
++		nd.ni_cnd.cn_nameiop = CREATE;
++		nd.ni_cnd.cn_flags = FWRITE | O_CREAT | O_APPEND;
++		error = nameiat(&nd, &log_vp);
++		nameidone(&nd);
++		if (error == 0) {
++			/* Set permissions */
++			struct vnode_attr va;
++			VATTR_INIT(&va);
++			VATTR_WANTED(&va, va_mode);
++			va.va_mode = 0644;
++			vnode_setattr(log_vp, &va, ctx);
++		}
++	}
++	if (error) {
++		log_vp = NULL;
++	}
++	return error;
++}
++
++static void
++log_vnode_close(void)
++{
++	if (log_vp) {
++		vnode_put(log_vp);
++		log_vp = NULL;
++	}
++}
++
++static int
++log_vnode_write(const char *buf, int len)
++{
++	if (!log_vp) return ENXIO;
++	vfs_context_t ctx = vfs_context_kernel();
++	struct uio uio;
++	struct iovec iov = { (void *)buf, len };
++	uio.uio_iov = &iov;
++	uio.uio_iovcnt = 1;
++	uio.uio_offset = 0; /* O_APPEND will handle this */
++	uio.uio_resid = len;
++	uio.uio_segflg = UIO_SYSSPACE;
++	uio.uio_rw = UIO_WRITE;
++	uio.uio_td = ctx;
++	return VNOP_WRITE(log_vp, &uio, 0, ctx);
++}
++
++static void
++log_flush_ring(void)
++{
++	if (log_ring_len == 0) return;
++	lck_mtx_lock(log_lock);
++	if (log_vnode_open() == 0) {
++		int head = log_ring_head;
++		int len = log_ring_len;
++		/* Read out in order */
++		if (head >= len) {
++			/* Data is contiguous */
++			log_vnode_write(log_ring + head - len, len);
++		} else {
++			/* Wrapped */
++			int first = LOG_RING_SIZE - (len - head);
++			log_vnode_write(log_ring + first, LOG_RING_SIZE - first);
++			log_vnode_write(log_ring, head);
++		}
++		log_vnode_close();
++		log_ring_len = 0;
++		log_ring_head = 0;
++	}
++	lck_mtx_unlock(log_lock);
++}
++
++static void
++log_thread_func(void *arg __unused, wait_result_t w __unused)
++{
++	for (;;) {
++		if (log_root_mounted) {
++			log_flush_ring();
++		}
++		thread_sleep(500); /* 500ms */
++	}
++}
++
++static void
++alioth_console_log_write(void *buf, int len)
++{
++	if (!log_root_mounted) {
++		log_ring_write(buf, len);
++		return;
++	}
++	lck_mtx_lock(log_lock);
++	if (log_vnode_open() == 0) {
++		log_vnode_write(buf, len);
++		log_vnode_close();
++	}
++	lck_mtx_unlock(log_lock);
++}
++
++void
++alioth_console_log_init(void)
++{
++	lck_grp_t *grp = lck_grp_alloc_init("alioth_console_log", LCK_GRP_ATTR_NULL);
++	log_lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
++
++	kern_return_t kr = kernel_thread_start(log_thread_func, NULL, &log_thread);
++	if (kr != KERN_SUCCESS) {
++		printf("ALIOTH console log: thread start failed %d\n", kr);
++	} else {
++		thread_deallocate(log_thread);
++	}
++
++	/* Hook into kernel printf */
++	sweet_console_log_write = alioth_console_log_write;
++
++	printf("ALIOTH console log: initialized (ring %d KB)\n", LOG_RING_SIZE / 1024);
++}
++
++/* Called when root filesystem is mounted */
++void
++alioth_console_log_root_mounted(void)
++{
++	log_root_mounted = true;
++	/* Flush early boot messages */
++	log_flush_ring();
++}
++#endif /* ARM64_BOARD_CONFIG_ALIOTH */

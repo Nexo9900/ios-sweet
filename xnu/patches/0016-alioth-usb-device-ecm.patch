@@ -1,0 +1,841 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@
+ bsd/dev/alioth_rpmh.c			standard
+ bsd/dev/alioth_spmi.c			standard
+ bsd/dev/alioth_battery.c		standard
++bsd/dev/alioth_usb.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -50,6 +50,7 @@
+ extern void alioth_keys_init(void);
+ extern void alioth_touch_init(void);
+ extern void alioth_rpmh_init(void);
++extern void alioth_usb_init(void);
+ extern void alioth_spmi_init(void);
+ extern void alioth_battery_init(void);
+
+@@ -607,6 +608,7 @@
+ 	alioth_keys_init();
+ 	alioth_touch_init();
+ 	alioth_rpmh_init();
++	alioth_usb_init();
+ 	alioth_spmi_init();
+ 	alioth_battery_init();
+ 	return 0;
+ }
+--- /dev/null
++++ b/bsd/dev/alioth_usb.c
+@@ -0,0 +1,900 @@
++/*
++ * ALIOTH USB device mode (DWC3) + CDC-ECM Ethernet function.
++ * Based on sweet_usb.c with alioth-specific adjustments.
++ * SM7150 DWC3 at 0x0a600000, PHY at 0x0a680000.
++ */
++#if defined(ARM64_BOARD_CONFIG_ALIOTH)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/kernel.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/kpi_socket.h>
++#include <sys/sockio.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/ethernet.h>
++#include <net/if_ether.h>
++#include <net/ether_if_module.h>
++#include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++#include <netinet/in.h>
++#include <net/if_media.h>
++#include <net/dlil.h>
++#include <sys/kern_event.h>
++#include <kern/locks.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <vm/pmap.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void alioth_hid_key(int key, int down);
++void alioth_usb_init(void);
++
++/* DWC3 registers (from sweet_usb.c, same IP) */
++#define DWC3_GSBUSCFG0    0x0010
++#define DWC3_GSBUSCFG1    0x0014
++#define DWC3_GTXTHRCFG    0x0018
++#define DWC3_GRXTHRCFG    0x001c
++#define DWC3_GCTL         0x0020
++#define DWC3_GSTS         0x0024
++#define DWC3_GUCTL        0x0028
++#define DWC3_GUCTL2       0x002c
++#define DWC3_GFLADJ       0x0030
++#define DWC3_GSNPSID      0x0038
++#define DWC3_GHWPARAMS0   0x003c
++#define DWC3_GHWPARAMS1   0x0040
++#define DWC3_GHWPARAMS2   0x0044
++#define DWC3_GHWPARAMS3   0x0048
++#define DWC3_GHWPARAMS4   0x004c
++#define DWC3_GHWPARAMS5   0x0050
++#define DWC3_GHWPARAMS6   0x0054
++#define DWC3_GHWPARAMS7   0x0058
++#define DWC3_GDBGFIFOSPACE 0x005c
++#define DWC3_GDBGLTSSM    0x0060
++#define DWC3_GDBGLNMCC    0x0064
++#define DWC3_GDBGBMU      0x0068
++#define DWC3_GDBGLSPMUX   0x006c
++#define DWC3_GDBGLSP      0x0070
++#define DWC3_GDBGEPINFO0  0x0074
++#define DWC3_GDBGEPINFO1  0x0078
++#define DWC3_GUSB2PHYCFG  0x00e0
++#define DWC3_GUSB3PIPECTL 0x00e4
++#define DWC3_GTXFIFOSIZ   0x00f0
++#define DWC3_GRXFIFOSIZ   0x00f4
++#define DWC3_GEVNTADRLO   0x0100
++#define DWC3_GEVNTADRHI   0x0104
++#define DWC3_GEVNTCOUNT   0x0108
++#define DWC3_GEVNTADRLO1  0x010c
++#define DWC3_GEVNTADRHI1  0x0110
++#define DWC3_GEVNTCOUNT1  0x0114
++#define DWC3_GHWPARAMS8   0x0118
++#define DWC3_GTXFIFOPRIDEV 0x0120
++#define DWC3_GRXFIFOPRIDEV 0x0124
++#define DWC3_DCFG         0x0800
++#define DWC3_DCTL         0x0804
++#define DWC3_DEVTEN       0x0808
++#define DWC3_DSTS         0x080c
++#define DWC3_DGCMD        0x0810
++#define DWC3_DGCMDPAR     0x0814
++#define DWC3_DALEPENA     0x0818
++#define DWC3_DEPCMD       0x0820
++#define DWC3_DEPCMDPAR    0x0824
++#define DWC3_DEPCMDPAR2   0x0828
++
++#define DWC3_DCTL_CSFTRST     (1u << 0)
++#define DWC3_DCTL_RUN_STOP    (1u << 1)
++#define DWC3_DCTL_HIRD        (3u << 2)
++#define DWC3_DCTL_ULPSC       (1u << 4)
++#define DWC3_DCTL_CSS         (1u << 5)
++#define DWC3_DCTL_L1_HIBER    (1u << 6)
++#define DWC3_DCTL_GNP         (1u << 7)
++#define DWC3_DCTL_GGNP        (1u << 8)
++#define DWC3_DCTL_KEP         (1u << 9)
++#define DWC3_DCTL_CRS         (1u << 10)
++#define DWC3_DCTL_CSS         (1u << 5)
++
++#define DWC3_DSTS_CONNECTSPD_SHIFT  1
++#define DWC3_DSTS_CONNECTSPD_MASK   (0xfu << 1)
++#define DWC3_DSTS_USBLNKST_SHIFT    5
++#define DWC3_DSTS_USBLNKST_MASK     (0xfu << 5)
++#define DWC3_DSTS_SOFFN_SHIFT       17
++#define DWC3_DSTS_SOFFN_MASK        (0x3fffu << 17)
++#define DWC3_DSTS_DEVCTRLSPD_SHIFT  26
++#define DWC3_DSTS_DEVCTRLSPD_MASK   (0xfu << 26)
++
++#define DWC3_DEPCMD_DEPSTARTCFG   (1u << 0)
++#define DWC3_DEPCMD_SETEPCONFIG   (2u << 0)
++#define DWC3_DEPCMD_SETTRANSFRESOURCE (3u << 0)
++#define DWC3_DEPCMD_ENDTRANSFER   (4u << 0)
++#define DWC3_DEPCMD_STARTRTRANS   (5u << 0)
++#define DWC3_DEPCMD_UPDATETRANSFER (6u << 0)
++#define DWC3_DEPCMD_ENDTRANSFER   (7u << 0)
++#define DWC3_DEPCMD_CLRSTALL      (8u << 0)
++#define DWC3_DEPCMD_SETSTALL      (9u << 0)
++#define DWC3_DEPCMD_STARTCMD      (1u << 31)
++
++#define DEPCFG_EPTYPE_SHIFT       1
++#define DEPCFG_EPTYPE_MASK        (0x3u << 1)
++#define DEPCFG_EPTYPE_CONTROL     (0u << 1)
++#define DEPCFG_EPTYPE_ISOCH       (1u << 1)
++#define DEPCFG_EPTYPE_BULK        (2u << 1)
++#define DEPCFG_EPTYPE_INTR        (3u << 1)
++#define DEPCFG_EPDIR              (1u << 0)
++#define DEPCFG_MAXPACKET_SHIFT    3
++#define DEPCFG_MAXPACKET_MASK     (0x3ffu << 3)
++#define DEPCFG_NUM_XFER_RES_SHIFT 16
++#define DEPCFG_NUM_XFER_RES_MASK  (0x3fu << 16)
++#define DEPCFG_MULT_SHIFT         22
++#define DEPCFG_MULT_MASK          (0x3u << 22)
++
++#define TRBCTL_NORMAL             (1u << 4)
++#define TRBCTL_IOC                (1u << 5)
++#define TRBCTL_ISP_IMI            (1u << 6)
++#define TRBCTL_HWO                (1u << 31)
++
++/* USB standard requests */
++#define USB_REQ_GET_STATUS        0x00
++#define USB_REQ_CLEAR_FEATURE     0x01
++#define USB_REQ_SET_FEATURE       0x03
++#define USB_REQ_SET_ADDRESS       0x05
++#define USB_REQ_GET_DESCRIPTOR    0x06
++#define USB_REQ_SET_DESCRIPTOR    0x07
++#define USB_REQ_GET_CONFIGURATION 0x08
++#define USB_REQ_SET_CONFIGURATION 0x09
++#define USB_REQ_GET_INTERFACE     0x0a
++#define USB_REQ_SET_INTERFACE     0x0b
++#define USB_REQ_SYNCH_FRAME       0x0c
++
++/* USB descriptor types */
++#define USB_DT_DEVICE             0x01
++#define USB_DT_CONFIG             0x02
++#define USB_DT_STRING             0x03
++#define USB_DT_INTERFACE          0x04
++#define USB_DT_ENDPOINT           0x05
++#define USB_DT_DEVICE_QUALIFIER   0x06
++#define USB_DT_OTHER_SPEED        0x07
++#define USB_DT_INTERFACE_POWER    0x08
++#define USB_DT_OTG                0x09
++#define USB_DT_DEBUG              0x0a
++#define USB_DT_INTERFACE_ASSOC    0x0b
++#define USB_DT_BOS                0x0f
++#define USB_DT_DEVICE_CAPABILITY  0x10
++#define USB_DT_CS_INTERFACE       0x24
++#define USB_DT_CS_ENDPOINT        0x25
++
++/* CDC subclass codes */
++#define USB_CDC_SUBCLASS_ECM      0x06
++#define USB_CDC_ACM               0x02
++
++/* CDC request codes */
++#define CDC_REQ_SEND_ENCAPSULATED  0x00
++#define CDC_REQ_GET_ENCAPSULATED   0x01
++#define CDC_REQ_SET_COMM_FEATURE   0x02
++#define CDC_REQ_GET_COMM_FEATURE   0x03
++#define CDC_REQ_CLEAR_COMM_FEATURE 0x04
++#define CDC_REQ_SET_LINE_CODING    0x20
++#define CDC_REQ_GET_LINE_CODING    0x21
++#define CDC_REQ_SET_CONTROL_LINE   0x22
++#define CDC_REQ_SEND_BREAK         0x23
++#define CDC_REQ_SET_ETHERNET_MULTICAST_FILTERS 0x40
++#define CDC_REQ_SET_ETHERNET_PACKET_FILTER     0x41
++#define CDC_REQ_GET_ETHERNET_STATISTICS        0x42
++
++/* ECM notification codes */
++#define CDC_NTF_NETWORK_CONNECTION 0x00
++#define CDC_NTF_RESPONSE_AVAILABLE 0x01
++#define CDC_NTF_SERIAL_STATE       0x20
++
++/* PHY registers (QUSB2 PHY) */
++#define QSCRATCH_BASE     0x0a6f8000
++#define HS_PHY_CTRL       0x00
++#define SS_PHY_CTRL       0x04
++#define UTMI_OTG_VBUS_VALID       (1u << 20)
++#define SW_SESSVLD_SEL            (1u << 28)
++#define LANE0_PWR_PRESENT         (1u << 24)
++
++#define ALIOTH_USB_DWC_PA   0x0a600000u
++#define ALIOTH_USB_QSCRATCH_PA 0x0a6f8000u
++
++#define UD_EVT_SIZE     0x1000
++#define UD_TRB_OUT      0x1000
++#define UD_TRB_IN       0x1010
++#define UD_TRB_RX       0x1020
++#define UD_TRB_TX       0x1030
++#define UD_TRB_INT      0x1050
++#define UD_SETUP        0x1040
++#define UD_DATA         0x1100
++#define UD_NOTIFY       0x1300
++#define UD_RX           0x2000
++#define UD_TX           0x2800
++#define UD_FRAME_MAX    0x800
++#define UD_SIZE         0x4000
++#define UD_TXQ          32
++
++#define EP_RX           2
++#define EP_TX           3
++#define EP_INT          5
++
++static struct {
++	vm_offset_t dwc;
++	vm_offset_t qscratch;
++	vm_offset_t dma;
++	uint64_t dma_pa;
++	enum { EP0_SETUP, EP0_DATA, EP0_WAIT_STATUS2, EP0_WAIT_STATUS3, EP0_STATUS } state;
++	bool        data_in;
++	uint32_t    events;
++	bool        configured;
++	uint8_t     data_alt;
++	ifnet_t     ifp;
++	lck_mtx_t  *lock;
++	mbuf_t      txq[UD_TXQ];
++	unsigned    txq_head, txq_count;
++	bool        tx_busy;
++	uint64_t    rx_frames, tx_frames;
++	uint32_t    evt_pos;
++} ud;
++
++static inline uint32_t
++dwc_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(ud.dwc + off);
++}
++
++static inline void
++dwc_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(ud.dwc + off) = v;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static inline void
++dwc_wr64(uint32_t off, uint64_t v)
++{
++	dwc_wr(off, (uint32_t)v);
++	dwc_wr(off + 4, (uint32_t)(v >> 32));
++}
++
++static inline uint64_t
++dwc_rd64(uint32_t off)
++{
++	return ((uint64_t)dwc_rd(off + 4) << 32) | dwc_rd(off);
++}
++
++static inline void
++ud_sync(uint32_t off, uint32_t len)
++{
++	__asm__ volatile("dsb osh" ::: "memory");
++	flush_dcache64(ud.dma_pa + off, len, TRUE);
++	__asm__ volatile("dmb oshld" ::: "memory");
++}
++
++static void
++ud_start_trb(unsigned ep, uint32_t trb, uint32_t buf, uint32_t len, uint32_t ctl)
++{
++	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + trb);
++	uint64_t bpa = ud.dma_pa + buf;
++	t[0] = (uint32_t)bpa;
++	t[1] = (uint32_t)(bpa >> 32);
++	t[2] = (len & 0xffffff) | ctl;
++	t[3] = 0;
++	ud_sync(trb, 16);
++}
++
++static void
++ud_start(unsigned ep, uint32_t buf, uint32_t len, uint32_t ctl)
++{
++	ud_start_trb(ep, ep ? UD_TRB_IN : UD_TRB_OUT, buf, len, ctl);
++}
++
++static void
++ud_start_setup(void)
++{
++	ud.state = EP0_SETUP;
++	ud_start(0, UD_SETUP, 8, TRBCTL_NORMAL | TRBCTL_IOC);
++}
++
++static void
++ud_start_status(bool in)
++{
++	ud.state = in ? EP0_WAIT_STATUS2 : EP0_WAIT_STATUS3;
++	ud_start(in ? 1 : 0, UD_DATA, 0, TRBCTL_NORMAL | TRBCTL_IOC);
++}
++
++static void
++ud_ack_status(void)
++{
++	ud.state = EP0_STATUS;
++	ud_start(0, UD_DATA, 0, TRBCTL_NORMAL);
++}
++
++static int
++ud_epcmd(unsigned ep, uint32_t cmd, uint32_t param0, uint32_t param1, uint32_t param2)
++{
++	dwc_wr(DEPCMDPAR + (ep * 0x10), param0);
++	dwc_wr(DEPCMDPAR2 + (ep * 0x10), param1);
++	dwc_wr(DEPCMD + (ep * 0x10), cmd | DEPCMD_STARTCMD | (ep << 16));
++	for (int i = 0; i < 1000; ++i) {
++		if ((dwc_rd(DEPCMD + (ep * 0x10)) & DEPCMD_STARTCMD) == 0) {
++			return 0;
++		}
++		delay(1);
++	}
++	return ETIMEDOUT;
++}
++
++/* USB descriptors: CDC-ECM Ethernet function */
++static const uint8_t ud_dev_desc[18] = {
++	18, 1, 0x00, 0x02, 0x02, 0x00, 0x00, 64,
++	0x09, 0x12, 0x01, 0x00, 0x00, 0x01, 1, 2, 3, 1,
++};
++
++static const uint8_t ud_cfg_desc[80] = {
++	9, 2, 80, 0, 2, 1, 0, 0x80, 250,                /* config: 2 interfaces, 500 mA */
++	9, 4, 0, 0, 1, 0x02, 0x06, 0x00, 0,             /* comm interface 0: CDC ECM, 1 endpoint */
++	5, 0x24, 0x00, 0x10, 0x01,                      /* header, CDC 1.10 */
++	5, 0x24, 0x06, 0, 1,                            /* union: control 0, data 1 */
++	13, 0x24, 0x0f, 4, 0, 0, 0, 0, 0xea, 0x05, 0, 0, 0, /* ethernet: MAC string 4, max segment 1514 */
++	7, 5, 0x82, 0x03, 16, 0, 9,                     /* ep 0x82 interrupt IN, 16 bytes, 2^(9-1) uframes */
++	9, 4, 1, 0, 0, 0x0a, 0x00, 0x00, 0,             /* data interface 1 alt 0: no endpoints */
++	9, 4, 1, 1, 2, 0x0a, 0x00, 0x00, 0,             /* data interface 1 alt 1: two bulk endpoints */
++	7, 5, 0x81, 0x02, 0x00, 0x02, 0,                /* ep 0x81 bulk IN, 512 */
++	7, 5, 0x01, 0x02, 0x00, 0x02, 0,                /* ep 0x01 bulk OUT, 512 */
++};
++
++/* The host side's MAC (ECM iMACAddress); the phone's own is ..:02 */
++static const char *const ud_strings[] = {
++	NULL, "ios-sweet", "Sweet iOS (USB Ethernet)", "0001", "02005E77EE01",
++};
++static const uint8_t ud_phone_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
++
++static uint32_t
++ud_string(unsigned idx, uint8_t *out)
++{
++	if (idx >= sizeof(ud_strings) / sizeof(ud_strings[0])) return 0;
++	const char *s = ud_strings[idx];
++	if (!s) return 0;
++	uint32_t n = 0;
++	out[n++] = strlen(s) * 2 + 2;
++	out[n++] = USB_DT_STRING;
++	for (const char *p = s; *p; ++p) {
++		out[n++] = *p;
++		out[n++] = 0;
++	}
++	return n;
++}
++
++static void
++ud_notify_connected(void)
++{
++	uint8_t *n = (uint8_t *)(ud.dma + UD_NOTIFY);
++	n[0] = 0xa1; n[1] = 0x00;       /* NETWORK_CONNECTION */
++	n[2] = 1; n[3] = 0;             /* connected */
++	n[4] = 0; n[5] = 0;             /* interface 0 */
++	n[6] = 0; n[7] = 0;
++	ud_start_trb(EP_INT, UD_TRB_INT, UD_NOTIFY, 8, TRBCTL_NORMAL);
++}
++
++static void
++ud_link_event(bool up)
++{
++	if (ud.ifp != NULL) {
++		dlil_post_msg(ud.ifp, KEV_DL_SUBCLASS, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, NULL, 0, FALSE);
++	}
++}
++
++/* SET_CONFIGURATION(1): bulk IN/OUT and the interrupt endpoint. */
++static void
++ud_configure(void)
++{
++	if (ud.configured) return;
++	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG | (2u << 16), 0, 0, 0) ||
++	    ud_epcmd(EP_RX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3), (1u << 8) | ((uint32_t)EP_RX << 25), 0) ||
++	    ud_epcmd(EP_RX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++	    ud_epcmd(EP_TX, DEPCMD_SETEPCONFIG, (2u << 1) | (512u << 3) | (1u << 17), (1u << 8) | ((uint32_t)EP_TX << 25), 0) ||
++	    ud_epcmd(EP_TX, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0) ||
++	    ud_epcmd(EP_INT, DEPCMD_SETEPCONFIG, (3u << 1) | (16u << 3) | (2u << 17),
++	    (1u << 8) | (8u << 16) | ((uint32_t)EP_INT << 25), 0) ||
++	    ud_epcmd(EP_INT, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
++		printf("ALIOTH USB: data endpoints setup failed\n");
++		return;
++	}
++	dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << EP_RX) | (1u << EP_TX) | (1u << EP_INT));
++	ud.configured = true;
++	ud_rx_arm();
++	printf("ALIOTH USB: ECM endpoints configured\n");
++}
++
++static void
++ud_rx_arm(void)
++{
++	ud_start_trb(EP_RX, UD_TRB_RX, UD_RX, UD_FRAME_MAX, TRBCTL_NORMAL);
++}
++
++static void
++ud_rx_done(void)
++{
++	volatile uint32_t *t = (volatile uint32_t *)(ud.dma + UD_TRB_RX);
++	ud_sync(UD_TRB_RX, 16);
++	uint32_t len = UD_FRAME_MAX - (t[2] & 0xffffff);
++	ud_sync(UD_RX, UD_FRAME_MAX);
++	if (ud.ifp != NULL && len >= ETHER_HDR_LEN && len <= ETHER_MAX_LEN) {
++		mbuf_t m = NULL;
++		if (mbuf_allocpacket(MBUF_DONTWAIT, len, NULL, &m) == 0 &&
++		    mbuf_copyback(m, 0, len, (const void *)(ud.dma + UD_RX), MBUF_DONTWAIT) == 0) {
++			struct ifnet_stat_increment_param stats = {};
++			void *frame_header = mbuf_data(m);
++			mbuf_pkthdr_setrcvif(m, ud.ifp);
++			mbuf_pkthdr_setheader(m, frame_header);
++			mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
++			(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
++			stats.packets_in = 1;
++			stats.bytes_in = len;
++			ud.rx_frames++;
++			ifnet_input(ud.ifp, m, &stats);
++		} else if (m != NULL) {
++			mbuf_freem(m);
++		}
++	}
++	ud_rx_arm();
++}
++
++static void
++ud_tx_kick_locked(void)
++{
++	while (!ud.tx_busy && ud.txq_count > 0 && ud.configured) {
++		mbuf_t m = ud.txq[ud.txq_head];
++		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
++		ud.txq_count--;
++		size_t len = mbuf_pkthdr_len(m);
++		if (len > ETHER_MAX_LEN - ETHER_CRC_LEN) {
++			mbuf_freem(m);
++			continue;
++		}
++		mbuf_copydata(m, 0, len, (void *)(ud.dma + UD_TX));
++		mbuf_freem(m);
++		if ((len % 512) == 0) {
++			((uint8_t *)(ud.dma + UD_TX))[len++] = 0;
++		}
++		ud.tx_busy = true;
++		ud.tx_frames++;
++		ud_start_trb(EP_TX, UD_TRB_TX, UD_TX, (uint32_t)len, TRBCTL_NORMAL);
++	}
++}
++
++static errno_t
++ud_if_output(ifnet_t ifp, mbuf_t m)
++{
++	lck_mtx_lock(ud.lock);
++	if (ud.txq_count == UD_TXQ || !ud.configured) {
++		lck_mtx_unlock(ud.lock);
++		mbuf_freem(m);
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		return 0;
++	}
++	ifnet_stat_increment_out(ifp, 1, mbuf_pkthdr_len(m), 0);
++	ud.txq[(ud.txq_head + ud.txq_count) % UD_TXQ] = m;
++	ud.txq_count++;
++	ud_tx_kick_locked();
++	lck_mtx_unlock(ud.lock);
++	return 0;
++}
++
++static errno_t
++ud_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
++{
++	switch (cmd) {
++	case SIOCGIFMEDIA32:
++	case SIOCGIFMEDIA64: {
++		struct ifmediareq *ifmr = (struct ifmediareq *)data;
++		user_addr_t list = (cmd == SIOCGIFMEDIA64) ?
++		    ((struct ifmediareq64 *)ifmr)->ifmu_ulist :
++		    CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
++		int media = IFM_ETHER | IFM_AUTO;
++		ifmr->ifm_current = media;
++		ifmr->ifm_active = ud.configured ? (IFM_ETHER | IFM_1000_T | IFM_FDX) : media;
++		ifmr->ifm_mask = 0;
++		ifmr->ifm_status = IFM_AVALID | (ud.configured ? IFM_ACTIVE : 0);
++		if (list != USER_ADDR_NULL && ifmr->ifm_count > 0) {
++			ifmr->ifm_count = 1;
++			return copyout(&media, list, sizeof(media));
++		}
++		ifmr->ifm_count = 1;
++		return 0;
++	}
++	case SIOCSIFADDR:
++	case SIOCAIFADDR:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		return 0;
++	case SIOCSIFFLAGS:
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static void
++ud_if_detach(ifnet_t ifp __unused)
++{
++}
++
++static void
++ud_if_create(void)
++{
++	struct ifnet_init_eparams init;
++	static lck_grp_t *grp;
++
++	grp = lck_grp_alloc_init("alioth_usb", LCK_GRP_ATTR_NULL);
++	ud.lock = lck_mtx_alloc_init(grp, LCK_ATTR_NULL);
++
++	bzero(&init, sizeof(init));
++	init.ver = IFNET_INIT_CURRENT_VERSION;
++	init.len = sizeof(init);
++	init.flags = IFNET_INIT_LEGACY;
++	init.uniqueid = "alioth-usb-ecm";
++	init.uniqueid_len = sizeof("alioth-usb-ecm") - 1;
++	init.name = "en";  /* Use en* so configd recognizes it */
++	init.unit = 0;
++	init.family = IFNET_FAMILY_ETHERNET;
++	init.type = IFT_ETHER;
++	init.output = ud_if_output;
++	init.demux = ether_demux;
++	init.add_proto = ether_add_proto;
++	init.del_proto = ether_del_proto;
++	init.check_multi = ether_check_multi;
++	init.framer_extended = ether_frameout_extended;
++	init.ioctl = ud_if_ioctl;
++	init.detach = ud_if_detach;
++	init.broadcast_addr = etherbroadcastaddr;
++	init.broadcast_len = ETHER_ADDR_LEN;
++	if (ifnet_allocate_extended(&init, &ud.ifp) != 0) {
++		printf("ALIOTH USB: ifnet_allocate failed\n");
++		ud.ifp = NULL;
++		return;
++	}
++	ifnet_set_addrlen(ud.ifp, ETHER_ADDR_LEN);
++	ifnet_set_hdrlen(ud.ifp, sizeof(struct ether_header));
++	ifnet_set_mtu(ud.ifp, ETHERMTU);
++	ifnet_set_baudrate(ud.ifp, 480000000);
++	ifnet_set_flags(ud.ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
++	if (ifnet_attach(ud.ifp, NULL) != 0) {
++		printf("ALIOTH USB: ifnet_attach failed\n");
++		ud.ifp = NULL;
++		return;
++	}
++	ifnet_set_lladdr(ud.ifp, ud_phone_mac, ETHER_ADDR_LEN);
++
++	errno_t err = proto_plumb(PF_INET, ud.ifp);
++	socket_t so = NULL;
++	if (err == 0) {
++		err = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
++	}
++	if (err == 0) {
++		struct ifaliasreq ifra;
++		bzero(&ifra, sizeof(ifra));
++		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "en0");
++		struct sockaddr_in *a = (struct sockaddr_in *)&ifra.ifra_addr;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = htonl(0xc0a80702);         /* 192.168.7.2 */
++		a = (struct sockaddr_in *)&ifra.ifra_mask;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = htonl(0xffffff00);
++		a = (struct sockaddr_in *)&ifra.ifra_broadaddr;
++		a->sin_len = sizeof(*a);
++		a->sin_family = AF_INET;
++		a->sin_addr.s_addr = htonl(0xc0a807ff);
++		err = sock_ioctl(so, SIOCAIFADDR, &ifra);
++		sock_close(so);
++	}
++	ifnet_set_flags(ud.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
++	ud_link_event(true);
++	printf("ALIOTH USB: en0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
++}
++
++static void
++ud_setup(void)
++{
++	uint8_t *st = (uint8_t *)(ud.dma + UD_SETUP);
++	uint8_t *data = (uint8_t *)(ud.dma + UD_DATA);
++	uint8_t type = st[0], req = st[1];
++	uint16_t value = (uint16_t)(st[2] | st[3] << 8);
++	uint16_t index = (uint16_t)(st[4] | st[5] << 8);
++	uint16_t length = (uint16_t)(st[6] | st[7] << 8);
++	uint32_t n = 0;
++	bool ok = true;
++
++	if ((type & 0x60) == 0x20) {    /* class request (e.g. SET_ETHERNET_PACKET_FILTER) */
++		ok = (length == 0);
++	} else if ((type & 0x60) != 0) {
++		ok = false;
++	} else if (req == USB_REQ_GET_DESCRIPTOR) {
++		switch (value >> 8) {
++		case USB_DT_DEVICE:
++			memcpy(data, ud_dev_desc, sizeof(ud_dev_desc));
++			n = sizeof(ud_dev_desc);
++			break;
++		case USB_DT_CONFIG:
++			memcpy(data, ud_cfg_desc, sizeof(ud_cfg_desc));
++			n = sizeof(ud_cfg_desc);
++			break;
++		case USB_DT_STRING:
++			n = ud_string(value & 0xff, data);
++			break;
++		default:
++			ok = false;
++		}
++	} else if (req == USB_REQ_SET_ADDRESS) {
++		dwc_wr(DCFG, dwc_rd(DCFG) | ((uint32_t)(value & 0x7f) << 3));
++		printf("ALIOTH USB: address %u\n", value & 0x7f);
++	} else if (req == USB_REQ_SET_CONFIGURATION) {
++		if (value == 1) ud_configure();
++		printf("ALIOTH USB: configured (%u)\n", value);
++	} else if (req == USB_REQ_GET_CONFIGURATION) {
++		data[0] = ud.configured ? 1 : 0; n = 1;
++	} else if (req == USB_REQ_GET_STATUS) {
++		data[0] = 0; data[1] = 0; n = 2;
++	} else if (req == USB_REQ_SET_INTERFACE) {
++		if (index == 1) {
++			ud.data_alt = (uint8_t)value;
++			if (value == 1 && ud.configured) ud_notify_connected();
++		}
++	} else if (req == USB_REQ_GET_INTERFACE) {
++		data[0] = index == 1 ? ud.data_alt : 0; n = 1;
++	} else if (req == USB_REQ_CLEAR_FEATURE || req == USB_REQ_SET_FEATURE) {
++	} else {
++		ok = false;
++	}
++	if (!ok) {
++		dwc_wr(DALEPENA, dwc_rd(DALEPENA) | (1u << 0) | (1u << 1));
++		return;
++	}
++	if (n) {
++		ud.data_in = true;
++		ud_start(1, UD_DATA, n, TRBCTL_NORMAL | TRBCTL_IOC);
++	} else {
++		ud_start_status(true);
++	}
++}
++
++static void
++ud_event(uint32_t ev)
++{
++	unsigned ep = (ev >> 1) & 0x1f;
++	unsigned type = (ev >> 6) & 0xf;
++	unsigned status = (ev >> 12) & 0xf;
++
++	if (ep == EP_RX && type == 1) {
++		ud_rx_done();
++		return;
++	}
++	if (ep == EP_TX && type == 1) {
++		lck_mtx_lock(ud.lock);
++		ud.tx_busy = false;
++		ud_tx_kick_locked();
++		lck_mtx_unlock(ud.lock);
++		return;
++	}
++	if (ep > 1) return;
++
++	if (type == 1) { /* XFER_COMPLETE */
++		if (ep == 0) {
++			if (status == 1) { /* short packet */
++				/* handle */
++			}
++			switch (ud.state) {
++			case EP0_SETUP:
++				ud_setup();
++				break;
++			case EP0_DATA:
++				ud_start_status(false);
++				break;
++			case EP0_WAIT_STATUS2:
++			case EP0_WAIT_STATUS3:
++				ud_ack_status();
++				break;
++			}
++		}
++	} else if (type == 2) { /* XFER_NOT_READY */
++		if (ep == 0) {
++			ud_start_setup();
++		}
++	}
++}
++
++static void
++ud_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint32_t ticks = 0;
++	for (;;) {
++		uint32_t count = dwc_rd(GEVNTCOUNT) & 0xffff;
++		if (count) {
++			for (uint32_t done = 0; done < count; done += 4) {
++				uint32_t ev = *(volatile uint32_t *)(ud.dma + UD_EVT + ud.evt_pos);
++				ud.evt_pos = (ud.evt_pos + 4) % UD_EVT_SIZE;
++				if (ud.events++ < 200) {
++					printf("ALIOTH USB: event 0x%08x\n", ev);
++				}
++				ud_event(ev);
++			}
++			dwc_wr(GEVNTCOUNT, count);
++		}
++		if ((++ticks % 30000) == 0) {
++			printf("ALIOTH USB: en0 rx %llu tx %llu frames\n", ud.rx_frames, ud.tx_frames);
++		}
++		delay(1000);
++	}
++}
++
++void
++alioth_usb_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++	if ((void *)ud.dwc) return;
++
++	(void)PE_parse_boot_argn("aliothusb", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("ALIOTH USB: disabled (aliothusb=0)\n");
++		return;
++	}
++
++	ud.dwc = ml_io_map(ALIOTH_USB_DWC_PA, 0x10000);
++	ud.qscratch = ml_io_map(ALIOTH_USB_QSCRATCH_PA, 0x10000);
++	if (!ud.dwc || !ud.qscratch) {
++		printf("ALIOTH USB: MMIO mapping failed\n");
++		return;
++	}
++
++	/* Force VBUS session in Qualcomm wrapper (QSCRATCH) */
++	uint32_t hs_phy = *(volatile uint32_t *)(ud.qscratch + HS_PHY_CTRL);
++	uint32_t ss_phy = *(volatile uint32_t *)(ud.qscratch + SS_PHY_CTRL);
++	hs_phy |= UTMI_OTG_VBUS_VALID | SW_SESSVLD_SEL;
++	ss_phy |= LANE0_PWR_PRESENT;
++	*(volatile uint32_t *)(ud.qscratch + HS_PHY_CTRL) = hs_phy;
++	*(volatile uint32_t *)(ud.qscratch + SS_PHY_CTRL) = ss_phy;
++	__asm__ volatile("dsb osh" ::: "memory");
++
++	uint32_t gsnpsid = dwc_rd(GSNPSID);
++	printf("ALIOTH USB: DWC3 GSNPSID 0x%08x\n", gsnpsid);
++
++	ppnum_t pn;
++	kern_return_t kr = vm_page_grab(&pn, VM_MEM_GUARDED);
++	if (kr != KERN_SUCCESS) {
++		printf("ALIOTH USB: vm_page_grab failed %d\n", kr);
++		return;
++	}
++	ud.dma = kmem_map(kernel_map, ptoa_64(pn), UD_SIZE, VM_PROT_READ | VM_PROT_WRITE, VM_KERN_MEMORY_NONE);
++	if (!ud.dma) {
++		printf("ALIOTH USB: kmem_map failed\n");
++		return;
++	}
++	ud.dma_pa = ptoa_64(pn);
++	ud_if_create();
++
++	/* Device controller soft reset */
++	dwc_wr(DCTL, DCTL_CSFTRST);
++	for (int i = 0; i < 1000; ++i) {
++		if ((dwc_rd(DCTL) & DCTL_CSFTRST) == 0) break;
++		delay(1);
++	}
++
++	/* Device config: HS, 8 endpoints */
++	dwc_wr(DCFG, (dwc_rd(DCFG) & ~0x3) | 0x0);
++
++	/* Event buffer */
++	dwc_wr64(GEVNTADRLO, ud.dma_pa + UD_EVT);
++	dwc_wr(GEVNTCOUNT, UD_EVT_SIZE / 4);
++
++	/* Enable interrupts */
++	dwc_wr(DALEPENA, 0);
++
++	/* Start RUN */
++	dwc_wr(DCTL, dwc_rd(DCTL) | DCTL_RUN_STOP);
++
++	/* Start event thread */
++	kr = kernel_thread_start(ud_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("ALIOTH USB: kernel_thread_start failed %d\n", kr);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_ALIOTH */

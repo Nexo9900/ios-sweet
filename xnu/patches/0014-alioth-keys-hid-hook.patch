@@ -1,0 +1,60 @@
+diff --git a/bsd/dev/alioth_keys.c b/bsd/dev/alioth_keys.c
+--- a/bsd/dev/alioth_keys.c
++++ b/bsd/dev/alioth_keys.c
+@@ -50,7 +50,7 @@
+
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+-extern void sweet_hid_key(int key, int down);
++extern void alioth_hid_key(int key, int down);
+ void alioth_keys_init(void);
+
+ #define KEYS_CORE_PA     0x0c440000u
+@@ -150,7 +150,7 @@
+ 			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
+ 				state[k] = now[k];
+ 				printf("ALIOTH KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
+ 				    k, state[k], pon, gpio);
+-				sweet_hid_key(k, state[k]);
++				alioth_hid_key(k, state[k]);
+ 			}
+ 		}
+ 		keys_wait();
+@@ -195,7 +195,7 @@
+ 	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+ 	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+ 	bool mok = keys_read(keys_gpio_apid, 0xc140, &mode);
+ 	bool eok = keys_read(keys_gpio_apid, 0xc146, &en);
+ 	bool sok = keys_read(keys_gpio_apid, 0xc105, &subtype);
+ 	printf("ALIOTH KEYS: arb=%#x apids=%u pon-apid=%u gpio4-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
+ 	    keys_version, count, keys_pon_apid, keys_gpio_apid,
+ 	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok);
+-	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
++	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
++
+ 	keys_sleep_chan = 0;
+ 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+diff --git a/bsd/dev/alioth_touch.c b/bsd/dev/alioth_touch.c
+--- a/bsd/dev/alioth_touch.c
++++ b/bsd/dev/alioth_touch.c
+@@ -20,7 +20,7 @@
+ extern int alioth_rpmh_vreg_enable(const char *res, unsigned mv);
+-extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void alioth_hid_touch(int finger, int down, int x, int y);
+ void alioth_touch_init(void);
+
+ /* GENI SE7 (QUP11) for touch I2C - from alioth DTB */
+@@ -101,7 +101,7 @@
+ 	}
+ 	if (mask & (1u << i)) {
+ 		st.x[i] = x[i];
+ 		st.y[i] = y[i];
+-		sweet_hid_touch(i, 1, x[i], y[i]);
++		alioth_hid_touch(i, 1, x[i], y[i]);
+ 	} else if (st.x[i] != 0 || st.y[i] != 0) {
+-		sweet_hid_touch(i, 0, st.x[i], st.y[i]);
++		alioth_hid_touch(i, 0, st.x[i], st.y[i]);
+ 	}
+ 	st.x[i] = x[i];
+ 	st.y[i] = y[i];

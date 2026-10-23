@@ -1,0 +1,66 @@
+diff --git a/tools/mkadt.py b/tools/mkadt.py
+--- a/tools/mkadt.py
++++ b/tools/mkadt.py
+@@ -130,6 +130,7 @@
+         ('model', cstr('iPhone10,3')),
+         ('target-type', cstr('D22')),
+         ('target-sub-type', u32(0)),
++        ('product-type', cstr('iPhone10,3')),
+         ('serial-number', cstr('F2LQKG5GJC17')),  # placeholder
+         ('board-id', u32(0x00000000)),
+@@ -140,6 +141,12 @@
+         ('reg', u64(fb, fb_size)),
+         ])
+
++    product = node('product', [
++        ph(),
++        ('compatible', cstr('D22AP')),
++        ('product-type', cstr('iPhone10,3')),
++    ])
++
+     ufs = node(f'{machine}-ufs', [
+         ph(),
+         ('compatible', cstr('qcom,ufshc')),
+@@ -155,6 +172,18 @@
+         ('compatible', cstr('qcom,spmi')),
+         ])
+
++    arm_io = node('arm-io', [
++        ph(),
++        ('compatible', cstr('qcom,sm7150-arm-io')),
++        ('#address-cells', u32(2)),
++        ('#size-cells', u32(2)),
++        ('ranges', empty),
++        disp0,
++        ufs,
++        spmi,
++    ])
++
+     buttons = node('buttons', [
+         ph(),
+         ('button-names', cstr('volup') + cstr('voldown') + cstr('hold')),
+         ('home-button-type', u32(2)),
+         ('opposed-power-vol-buttons', u32(1)),
+     ])
+
+     return node('device-tree', [
+         ph(),
+-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr(compat) + cstr('qcom,sm7150') + cstr('AppleARM')),
++        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr(compat) + cstr('qcom,sm7150') + cstr('AppleARM') + cstr('d22ap')),
+         ('model', cstr('iPhone10,3')),
+
+-        chosen,
+-        memory,
+-        buttons,
+-        ufs,
+-        spmi,
+-        gic,
++        chosen,
++        memory,
++        arm_io,
++        buttons,
++        product,
++        gic,
+         cpu,
+         timer,
+         pmu,

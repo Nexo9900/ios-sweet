@@ -1,0 +1,358 @@
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -15,6 +15,10 @@
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/AliothSurface.cpp                               optional iokitcpp
++iokit/Kernel/arm/AliothFramebuffer.cpp                           optional iokitcpp
++iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
++iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
++iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
++iokit/Kernel/arm/hid/AliothHID.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+--- /dev/null
++++ b/iokit/Kernel/arm/hid/AliothHID.h
+@@ -0,0 +1,200 @@
++/*
++ * ALIOTH HID event services - IOHIDEventService for buttons and touch.
++ * Based on SweetHID.cpp with alioth-specific adjustments.
++ */
++#if defined(ARM64_BOARD_CONFIG_ALIOTH)
++#ifndef _ALIOTH_HID_H
++#define _ALIOTH_HID_H
++
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/hid/IOHIDEventService.h>
++#include <IOKit/hid/IOHIDEvent.h>
++#include <libkern/OSByteOrder.h>
++
++// Key codes (matching sweet_hid_key)
++enum {
++    ALIOTH_HID_KEY_POWER = 0,
++    ALIOTH_HID_KEY_VOLUP = 1,
++    ALIOTH_HID_KEY_VOLDOWN = 2,
++    ALIOTH_HID_KEY_HOME = 3,
++};
++
++// HID usage pages
++#define HID_USAGE_PAGE_CONSUMER   0x0C
++#define HID_USAGE_CONSUMER_POWER  0x30
++#define HID_USAGE_CONSUMER_VOLUP  0xE9
++#define HID_USAGE_CONSUMER_VOLDN  0xEA
++#define HID_USAGE_CONSUMER_MENU   0x40
++
++// Digitizer collections
++#define ALIOTH_TOUCH_FINGERS      10
++#define ALIOTH_TOUCH_EDGE_PX      48
++#define ALIOTH_TOUCH_LOGICAL_W    1080
++#define ALIOTH_TOUCH_LOGICAL_H    2400
++
++class AliothHIDButtons : public IOHIDEventService {
++    OSDeclareDefaultStructors(AliothHIDButtons)
++public:
++    virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++    virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
++    virtual IOReturn handleStart(IOService *provider) APPLE_KEXT_OVERRIDE;
++    virtual IOReturn handleStop(IOService *provider) APPLE_KEXT_OVERRIDE;
++    virtual bool matchPropertyTable(OSDictionary *table, SInt32 *score) APPLE_KEXT_OVERRIDE;
++    virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++};
++
++class AliothHIDTouch : public IOHIDEventService {
++    OSDeclareDefaultStructors(AliothHIDTouch)
++public:
++    virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++    virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
++    virtual IOReturn handleStart(IOService *provider) APPLE_KEXT_OVERRIDE;
++    virtual IOReturn handleStop(IOService *provider) APPLE_KEXT_OVERRIDE;
++    virtual bool matchPropertyTable(OSDictionary *table, SInt32 *score) APPLE_KEXT_OVERRIDE;
++    virtual IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++
++protected:
++    IOLock *fLock;
++    int fLogicalW, fLogicalH;
++    bool fDown[ALIOTH_TOUCH_FINGERS];
++    bool fEdge[ALIOTH_TOUCH_FINGERS];
++    IOFixed fX[ALIOTH_TOUCH_FINGERS];
++    IOFixed fY[ALIOTH_TOUCH_FINGERS];
++};
++
++// C hooks called from bsd/dev/alioth_keys.c and bsd/dev/alioth_touch.c
++extern "C" {
++    void alioth_hid_key(int key, int down);
++    void alioth_hid_touch(int finger, int down, int x, int y);
++}
++
++#endif /* _ALIOTH_HID_H */
++#endif /* ARM64_BOARD_CONFIG_ALIOTH */
+--- /dev/null
++++ b/iokit/Kernel/arm/hid/AliothHID.cpp
+@@ -0,0 +1,600 @@
++/*
++ * ALIOTH HID event services implementation.
++ * Based on SweetHID.cpp with alioth-specific adjustments.
++ */
++#if defined(ARM64_BOARD_CONFIG_ALIOTH)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/hid/IOHIDEventService.h>
++#include <IOKit/hid/IOHIDEvent.h>
++#include <IOKit/hid/IOHIDUsageTables.h>
++#include <libkern/OSByteOrder.h>
++#include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSDictionary.h>
++#include "AliothHID.h"
++
++OSDefineMetaClassAndStructors(AliothHIDButtons, IOHIDEventService)
++OSDefineMetaClassAndStructors(AliothHIDTouch, IOHIDEventService)
++
++// --- AliothHIDButtons ---
++
++bool AliothHIDButtons::start(IOService *provider)
++{
++    if (!super::start(provider)) return false;
++
++    // Create HID descriptor for consumer keys (power, volume)
++    OSArray *collections = OSArray::withCapacity(4);
++
++    // Power button
++    OSDictionary *power = OSDictionary::withCapacity(4);
++    power->setObject(kIOHIDElementUsageKey, OSNumber::withNumber(HID_USAGE_CONSUMER_POWER, 32));
++    power->setObject(kIOHIDElementUsagePageKey, OSNumber::withNumber(HID_USAGE_PAGE_CONSUMER, 32));
++    power->setObject(kIOHIDElementTypeKey, OSNumber::withNumber(kIOHIDElementTypeInput_Misc, 32));
++    power->setObject(kIOHIDElementMinKey, OSNumber::withNumber(0, 32));
++    power->setObject(kIOHIDElementMaxKey, OSNumber::withNumber(1, 32));
++    collections->setObject(power);
++    power->release();
++
++    // Volume up
++    OSDictionary *volup = OSDictionary::withCapacity(4);
++    volup->setObject(kIOHIDElementUsageKey, OSNumber::withNumber(HID_USAGE_CONSUMER_VOLUP, 32));
++    volup->setObject(kIOHIDElementUsagePageKey, OSNumber::withNumber(HID_USAGE_PAGE_CONSUMER, 32));
++    volup->setObject(kIOHIDElementTypeKey, OSNumber::withNumber(kIOHIDElementTypeInput_Misc, 32));
++    volup->setObject(kIOHIDElementMinKey, OSNumber::withNumber(0, 32));
++    volup->setObject(kIOHIDElementMaxKey, OSNumber::withNumber(1, 32));
++    collections->setObject(volup);
++    volup->release();
++
++    // Volume down
++    OSDictionary *voldn = OSDictionary::withCapacity(4);
++    voldn->setObject(kIOHIDElementUsageKey, OSNumber::withNumber(HID_USAGE_CONSUMER_VOLDN, 32));
++    voldn->setObject(kIOHIDElementUsagePageKey, OSNumber::withNumber(HID_USAGE_PAGE_CONSUMER, 32));
++    voldn->setObject(kIOHIDElementTypeKey, OSNumber::withNumber(kIOHIDElementTypeInput_Misc, 32));
++    voldn->setObject(kIOHIDElementMinKey, OSNumber::withNumber(0, 32));
++    voldn->setObject(kIOHIDElementMaxKey, OSNumber::withNumber(1, 32));
++    collections->setObject(voldn);
++    voldn->release();
++
++    // Home button (menu)
++    OSDictionary *home = OSDictionary::withCapacity(4);
++    home->setObject(kIOHIDElementUsageKey, OSNumber::withNumber(HID_USAGE_CONSUMER_MENU, 32));
++    home->setObject(kIOHIDElementUsagePageKey, OSNumber::withNumber(HID_USAGE_PAGE_CONSUMER, 32));
++    home->setObject(kIOHIDElementTypeKey, OSNumber::withNumber(kIOHIDElementTypeInput_Misc, 32));
++    home->setObject(kIOHIDElementMinKey, OSNumber::withNumber(0, 32));
++    home->setObject(kIOHIDElementMaxKey, OSNumber::withNumber(1, 32));
++    collections->setObject(home);
++    home->release();
++
++    setProperty(kIOHIDReportDescriptorKey, collections);
++    collections->release();
++
++    // Set HID service properties
++    setProperty(kIOHIDDeviceUsageKey, OSNumber::withNumber(0x0001, 32)); // kIOHIDDeviceUsageGenericDesktop
++    setProperty(kIOHIDDeviceUsagePageKey, OSNumber::withNumber(0x000C, 32)); // kHIDPage_Consumer
++    setProperty(kIOHIDPrimaryUsageKey, OSNumber::withNumber(HID_USAGE_CONSUMER_POWER, 32));
++    setProperty(kIOHIDPrimaryUsagePageKey, OSNumber::withNumber(HID_USAGE_PAGE_CONSUMER, 32));
++
++    registerService();
++    IOLog("ALIOTH HID: Buttons service registered\n");
++    return true;
++}
++
++void AliothHIDButtons::stop(IOService *provider)
++{
++    super::stop(provider);
++}
++
++IOReturn AliothHIDButtons::handleStart(IOService *provider)
++{
++    return super::handleStart(provider);
++}
++
++IOReturn AliothHIDButtons::handleStop(IOService *provider)
++{
++    return super::handleStop(provider);
++}
++
++bool AliothHIDButtons::matchPropertyTable(OSDictionary *table, SInt32 *score)
++{
++    return super::matchPropertyTable(table, score);
++}
++
++IOReturn AliothHIDButtons::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler)
++{
++    return super::newUserClient(owningTask, securityID, type, properties, handler);
++}
++
++// --- AliothHIDTouch ---
++
++bool AliothHIDTouch::start(IOService *provider)
++{
++    if (!super::start(provider)) return false;
++
++    fLock = IOLockAlloc();
++    fLogicalW = ALIOTH_TOUCH_LOGICAL_W;
++    fLogicalH = ALIOTH_TOUCH_LOGICAL_H;
++    for (int i = 0; i < ALIOTH_TOUCH_FINGERS; ++i) {
++        fDown[i] = false;
++        fEdge[i] = false;
++        fX[i] = 0;
++        fY[i] = 0;
++    }
++
++    // Create HID descriptor for digitizer (touch)
++    OSArray *collections = OSArray::withCapacity(1);
++    OSDictionary *digitizer = OSDictionary::withCapacity(8);
++
++    digitizer->setObject(kIOHIDElementUsageKey, OSNumber::withNumber(kHIDUsage_Dig_TouchScreen, 32));
++    digitizer->setObject(kIOHIDElementUsagePageKey, OSNumber::withNumber(kHIDPage_Digitizer, 32));
++    digitizer->setObject(kIOHIDElementTypeKey, OSNumber::withNumber(kIOHIDElementTypeInput_Misc, 32));
++    digitizer->setObject(kIOHIDElementMinKey, OSNumber::withNumber(0, 32));
++    digitizer->setObject(kIOHIDElementMaxKey, OSNumber::withNumber(1, 32));
++    digitizer->setObject(kIOHIDElementUnitKey, OSNumber::withNumber(0, 32));
++    digitizer->setObject(kIOHIDElementUnitExponentKey, OSNumber::withNumber(0, 32));
++
++    collections->setObject(digitizer);
++    digitizer->release();
++
++    setProperty(kIOHIDReportDescriptorKey, collections);
++    collections->release();
++
++    // Digitizer properties
++    setProperty(kIOHIDDeviceUsageKey, OSNumber::withNumber(kHIDUsage_Dig_TouchScreen, 32));
++    setProperty(kIOHIDDeviceUsagePageKey, OSNumber::withNumber(kHIDPage_Digitizer, 32));
++    setProperty(kIOHIDPrimaryUsageKey, OSNumber::withNumber(kHIDUsage_Dig_TouchScreen, 32));
++    setProperty(kIOHIDPrimaryUsagePageKey, OSNumber::withNumber(kHIDPage_Digitizer, 32));
++    setProperty("DigitizerType", OSNumber::withNumber(2, 32)); // Direct input
++    setProperty("ReportTouchEvents", OSNumber::withNumber(1, 32));
++
++    registerService();
++    IOLog("ALIOTH HID: Touch service registered\n");
++    return true;
++}
++
++void AliothHIDTouch::stop(IOService *provider)
++{
++    if (fLock) IOLockFree(fLock);
++    super::stop(provider);
++}
++
++IOReturn AliothHIDTouch::handleStart(IOService *provider)
++{
++    return super::handleStart(provider);
++}
++
++IOReturn AliothHIDTouch::handleStop(IOService *provider)
++{
++    return super::handleStop(provider);
++}
++
++bool AliothHIDTouch::matchPropertyTable(OSDictionary *table, SInt32 *score)
++{
++    return super::matchPropertyTable(table, score);
++}
++
++IOReturn AliothHIDTouch::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler)
++{
++    return super::newUserClient(owningTask, securityID, type, properties, handler);
++}
++
++void
++AliothHIDTouch::dispatchTouchEvent(int finger, bool down, int x, int y)
++{
++    bool was = fDown[finger];
++    fDown[finger] = down;
++
++    if (!was && down) {
++        fEdge[finger] = (x < ALIOTH_TOUCH_EDGE_PX) || (x > fLogicalW - ALIOTH_TOUCH_EDGE_PX) ||
++                        (y < ALIOTH_TOUCH_EDGE_PX) || (y > fLogicalH - ALIOTH_TOUCH_EDGE_PX);
++    }
++
++    fX[finger] = (IOFixed)x << 16;
++    fY[finger] = (IOFixed)y << 16;
++
++    IOHIDEvent *collection = IOHIDEvent::withType(kIOHIDEventTypeDigitizer);
++    if (!collection) return;
++
++    collection->setIntegerValue(kIOHIDEventFieldDigitizerTransducerType, kIOHIDDigitizerTransducerTypeHand);
++    collection->setIntegerValue(kIOHIDEventFieldDigitizerTransducerIndex, finger);
++    collection->setIntegerValue(kIOHIDEventFieldDigitizerContactID, finger);
++
++    if (was != down) {
++        collection->setIntegerValue(kIOHIDEventFieldDigitizerTouch, down ? 1 : 0);
++        collection->setIntegerValue(kIOHIDEventFieldDigitizerRange, down ? 1 : 0);
++    }
++
++    collection->setIntegerValue(kIOHIDEventFieldDigitizerX, fX[finger]);
++    collection->setIntegerValue(kIOHIDEventFieldDigitizerY, fY[finger]);
++    collection->setIntegerValue(kIOHIDEventFieldDigitizerTipPressure, down ? 0x7fff : 0);
++
++    if (fEdge[finger]) {
++        collection->setIntegerValue(kIOHIDEventFieldDigitizerEventMask, kIOHIDDigitizerEventFromEdgeTip);
++    }
++
++    dispatchEvent(collection);
++    collection->release();
++
++    IOLog("ALIOTH HID: touch %d %s at %d,%d%s\n", finger, down ? "down" : "up", x, y, fEdge[finger] ? " edge" : "");
++}
++
++// --- C hooks ---
++
++extern "C" void
++alioth_hid_key(int key, int down)
++{
++    // Find the AliothHIDButtons service and dispatch event
++    OSIterator *iter = IORegistryEntry::getRegistryRoot()->getMatchingServices(IOService::serviceMatching("AliothHIDButtons"));
++    if (iter) {
++        AliothHIDButtons *service = OSDynamicCast(AliothHIDButtons, iter->getNextObject());
++        if (service) {
++            IOHIDEvent *event = IOHIDEvent::withType(kIOHIDEventTypeButton);
++            if (event) {
++                uint32_t usage = 0;
++                switch (key) {
++                    case ALIOTH_HID_KEY_POWER:   usage = HID_USAGE_CONSUMER_POWER; break;
++                    case ALIOTH_HID_KEY_VOLUP:   usage = HID_USAGE_CONSUMER_VOLUP; break;
++                    case ALIOTH_HID_KEY_VOLDOWN: usage = HID_USAGE_CONSUMER_VOLDN; break;
++                    case ALIOTH_HID_KEY_HOME:    usage = HID_USAGE_CONSUMER_MENU; break;
++                }
++                event->setIntegerValue(kIOHIDEventFieldButtonUsage, usage);
++                event->setIntegerValue(kIOHIDEventFieldButtonUsagePage, HID_USAGE_PAGE_CONSUMER);
++                event->setIntegerValue(kIOHIDEventFieldButtonState, down ? 1 : 0);
++                service->dispatchEvent(event);
++                event->release();
++            }
++        }
++        iter->release();
++    }
++}
++
++extern "C" void
++alioth_hid_touch(int finger, int down, int x, int y)
++{
++    OSIterator *iter = IORegistryEntry::getRegistryRoot()->getMatchingServices(IOService::serviceMatching("AliothHIDTouch"));
++    if (iter) {
++        AliothHIDTouch *service = OSDynamicCast(AliothHIDTouch, iter->getNextObject());
++        if (service) {
++            service->dispatchTouchEvent(finger, down, x, y);
++        }
++        iter->release();
++    }
++}
++#endif /* ARM64_BOARD_CONFIG_ALIOTH */

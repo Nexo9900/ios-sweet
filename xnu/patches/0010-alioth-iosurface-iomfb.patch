@@ -1,0 +1,329 @@
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -15,6 +15,8 @@
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/AliothSurface.cpp                               optional iokitcpp
++iokit/Kernel/arm/AliothFramebuffer.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+--- /dev/null
++++ b/iokit/Kernel/arm/AliothSurface.h
+@@ -0,0 +1,120 @@
++/*
++ * ALIOTH IOSurface kernel service (IOCoreSurfaceRoot + IOSurfaceRootUserClient).
++ * Based on SweetSurface.cpp with alioth-specific adjustments.
++ */
++#if defined(ARM64_BOARD_CONFIG_ALIOTH)
++#ifndef _ALIOTH_SURFACE_H
++#define _ALIOTH_SURFACE_H
++
++#include <IOKit/IOLib.h>
++#include <IOKit/IOSurface.h>
++#include <IOKit/IOUserClient.h>
++#include <libkern/OSMalloc.h>
++#include <mach/vm_prot.h>
++
++#define ALIOTH_SURFACE_SEL_LIMITS        13
++#define ALIOTH_SURFACE_SEL_CREATE         0
++#define ALIOTH_SURFACE_SEL_LOOKUP         4
++#define ALIOTH_SURFACE_SEL_SETVALUE       9
++#define ALIOTH_SURFACE_SEL_UPDATEVALUE   0x0a
++#define ALIOTH_SURFACE_SEL_REMOVEVALUE   0x0b
++#define ALIOTH_SURFACE_SEL_LOOKUP_MACH   0x22
++#define ALIOTH_SURFACE_SEL_CREATE_MACH   0x23
++
++#define ALIOTH_SURFACE_TRAP_INC_USE       0
++#define ALIOTH_SURFACE_TRAP_DEC_USE       1
++#define ALIOTH_SURFACE_TRAP_LOCK          2
++#define ALIOTH_SURFACE_TRAP_UNLOCK        3
++#define ALIOTH_SURFACE_TRAP_RELEASE       4
++#define ALIOTH_SURFACE_TRAP_RELEASE_FAILED 5
++
++#define ALIOTH_SURFACE_MAX_PLANES         4
++#define ALIOTH_SURFACE_MAX_WIRED_MB      1536
++
++struct alioth_surface_state {
++    uint64_t registry_id;
++    uint16_t bound_accel_ids[2];
++    uint32_t seed;
++    uint8_t  tiled;
++    uint32_t value_gen;
++    uint32_t ycbcr_matrix;
++    uint32_t nonbulk_size;
++    uint8_t  displayable;
++    uint8_t  sysmem_only;
++    uint8_t  bulk[0x70];
++};
++
++struct alioth_surface_plane {
++    uint32_t width, height, bytes_per_row, offset, size;
++    uint16_t bytes_per_element;
++    uint8_t  element_width, element_height;
++    uint8_t  component_count;
++    uint8_t  address_format;
++    uint8_t  compression_type;
++};
++
++class AliothSurfaceRoot : public IOService {
++    OSDeclareDefaultStructors(AliothSurfaceRoot)
++public:
++    virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++    virtual void stop(IOService *provider) APPLE_KEXT_OVERRIDE;
++    virtual IOService *newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++    virtual IOReturn registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon) APPLE_KEXT_OVERRIDE;
++};
++
++class AliothSurfaceUserClient : public IOUserClient {
++    OSDeclareDefaultStructors(AliothSurfaceUserClient)
++public:
++    virtual bool initWithTask(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties) APPLE_KEXT_OVERRIDE;
++    virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++    virtual IOReturn externalMethod(UInt32 selector, IOExternalMethodArguments *arguments, IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++    virtual IOReturn registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon) APPLE_KEXT_OVERRIDE;
++    virtual IOReturn getTargetAndTrapForIndex(IOExternalTrap **targetP, UInt32 *indexP, UInt32 trapIndex) APPLE_KEXT_OVERRIDE;
++
++protected:
++    task_t          fTask;
++    IOMemoryDescriptor *fSharedPage;
++    uint64_t        fSharedPagePhys;
++    uint32_t        fSeed;
++    bool            fRegistered;
++};
++
++#endif /* _ALIOTH_SURFACE_H */
++#endif /* ARM64_BOARD_CONFIG_ALIOTH */
+--- /dev/null
++++ b/iokit/Kernel/arm/AliothSurface.cpp
+@@ -0,0 +1,1100 @@
++/*
++ * ALIOTH IOSurface kernel service implementation.
++ * Based on SweetSurface.cpp with alioth-specific adjustments.
++ */
++#if defined(ARM64_BOARD_CONFIG_ALIOTH)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOSurface.h>
++#include <IOKit/IOUserClient.h>
++#include <libkern/OSMalloc.h>
++#include <libkern/OSByteOrder.h>
++#include <mach/vm_prot.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_map.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <sys/kern_memorystatus.h>
++#include "AliothSurface.h"
++
++OSDefineMetaClassAndStructors(AliothSurfaceRoot, IOService)
++OSDefineMetaClassAndStructors(AliothSurfaceUserClient, IOUserClient)
++
++// Global surface registry
++static struct {
++    IOLock *lock;
++    OSDictionary *by_id;
++    uint32_t next_id;
++    uint32_t wired_bytes;
++} gAliothSurfaces = {0};
++
++// Selector dispatch tables
++static const IOExternalMethodDispatch gAliothSurfaceMethods[] = {
++    // sel 0: Create
++    { (IOExternalMethodAction)&AliothSurfaceUserClient::sCreate, kIOUCStructIStructO, 0, 0xA68 },
++    // sel 4: Lookup
++    { (IOExternalMethodAction)&AliothSurfaceUserClient::sLookup, kIOUCStructIStructO, 0, 0xA68 },
++    // sel 9: SetValue
++    { (IOExternalMethodAction)&AliothSurfaceUserClient::sSetValue, kIOUCStructIScalarO, 8, 4 },
++    // sel 0x0a: UpdateNonBulkValueCache
++    { (IOExternalMethodAction)&AliothSurfaceUserClient::sUpdateValueCache, kIOUCStructIStructO, 0, 4 },
++    // sel 0x0b: RemoveValue
++    { (IOExternalMethodAction)&AliothSurfaceUserClient::sRemoveValue, kIOUCStructIScalarO, 8, 4 },
++    // sel 0x13: Log
++    { (IOExternalMethodAction)&AliothSurfaceUserClient::sLog, kIOUCStructIStructO, 0, 0 },
++    // sel 0x1b: SetBulkAttachments
++    { (IOExternalMethodAction)&AliothSurfaceUserClient::sSetBulkAttachments, kIOUCStructIStructO, 0x88, 0 },
++    // sel 0x22: LookupFromMachPort
++    { (IOExternalMethodAction)&AliothSurfaceUserClient::sLookupFromMachPort, kIOUCStructIStructO, 4, 0xA68 },
++    // sel 0x23: CreateMachPort
++    { (IOExternalMethodAction)&AliothSurfaceUserClient::sCreateMachPort, kIOUCScalarIScalarO, 8, 4 },
++    { NULL, 0, 0, 0 }
++};
++
++static const IOExternalTrap gAliothSurfaceTraps[] = {
++    { (IOExternalTrapAction)&AliothSurfaceUserClient::tIncUseCount },
++    { (IOExternalTrapAction)&AliothSurfaceUserClient::tDecUseCount },
++    { (IOExternalTrapAction)&AliothSurfaceUserClient::tLock },
++    { (IOExternalTrapAction)&AliothSurfaceUserClient::tUnlock },
++    { (IOExternalTrapAction)&AliothSurfaceUserClient::tRelease },
++    { (IOExternalTrapAction)&AliothSurfaceUserClient::tReleaseFailed },
++    { NULL }
++};
++
++// --- AliothSurfaceRoot ---
++
++bool AliothSurfaceRoot::start(IOService *provider)
++{
++    if (!super::start(provider)) return false;
++
++    gAliothSurfaces.lock = IOLockAlloc();
++    gAliothSurfaces.by_id = OSDictionary::withCapacity(32);
++    gAliothSurfaces.next_id = 1;
++    gAliothSurfaces.wired_bytes = 0;
++
++    registerService();
++    IOLog("ALIOTH SURF: IOCoreSurfaceRoot registered\n");
++    return true;
++}
++
++void AliothSurfaceRoot::stop(IOService *provider)
++{
++    if (gAliothSurfaces.by_id) gAliothSurfaces.by_id->release();
++    if (gAliothSurfaces.lock) IOLockFree(gAliothSurfaces.lock);
++    super::stop(provider);
++}
++
++IOService *AliothSurfaceRoot::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler)
++{
++    AliothSurfaceUserClient *client = OSTypeAlloc(AliothSurfaceUserClient);
++    if (!client) return NULL;
++    if (!client->init()) {
++        client->release();
++        return NULL;
++    }
++    *handler = client;
++    return client;
++}
++
++IOReturn AliothSurfaceRoot::registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon)
++{
++    return kIOReturnUnsupported;
++}
++
++// --- AliothSurfaceUserClient ---
++
++bool AliothSurfaceUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties)
++{
++    if (!super::initWithTask(owningTask, securityID, type, properties)) return false;
++    fTask = owningTask;
++    fSharedPage = NULL;
++    fSharedPagePhys = 0;
++    fSeed = 0;
++    fRegistered = false;
++    return true;
++}
++
++IOReturn AliothSurfaceUserClient::clientClose(void)
++{
++    if (fSharedPage) {
++        fSharedPage->release();
++        fSharedPage = NULL;
++    }
++    return super::clientClose();
++}
++
++IOReturn AliothSurfaceUserClient::externalMethod(UInt32 selector, IOExternalMethodArguments *arguments, IOExternalMethodDispatch *dispatch, OSObject *target, void *reference)
++{
++    if (selector >= (sizeof(gAliothSurfaceMethods)/sizeof(gAliothSurfaceMethods[0])) || gAliothSurfaceMethods[selector].function == NULL) {
++        return kIOReturnUnsupported;
++    }
++    return super::externalMethod(selector, arguments, &gAliothSurfaceMethods[selector], this, reference);
++}
++
++IOReturn AliothSurfaceUserClient::registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon)
++{
++    return kIOReturnUnsupported;
++}
++
++IOReturn AliothSurfaceUserClient::getTargetAndTrapForIndex(IOExternalTrap **targetP, UInt32 *indexP, UInt32 trapIndex)
++{
++    if (trapIndex >= (sizeof(gAliothSurfaceTraps)/sizeof(gAliothSurfaceTraps[0])) || gAliothSurfaceTraps[trapIndex].function == NULL) {
++        return kIOReturnUnsupported;
++    }
++    *targetP = (IOExternalTrap *)this;
++    *indexP = trapIndex;
++    return kIOReturnSuccess;
++}
++
++// --- Selector implementations ---
++
++IOReturn AliothSurfaceUserClient::sCreate(IOExternalMethodArguments *args)
++{
++    // Implementation would create a new surface
++    // For now, return unsupported
++    return kIOReturnUnsupported;
++}
++
++IOReturn AliothSurfaceUserClient::sLookup(IOExternalMethodArguments *args)
++{
++    return kIOReturnUnsupported;
++}
++
++IOReturn AliothSurfaceUserClient::sSetValue(IOExternalMethodArguments *args)
++{
++    return kIOReturnUnsupported;
++}
++
++IOReturn AliothSurfaceUserClient::sUpdateValueCache(IOExternalMethodArguments *args)
++{
++    return kIOReturnUnsupported;
++}
++
++IOReturn AliothSurfaceUserClient::sRemoveValue(IOExternalMethodArguments *args)
++{
++    return kIOReturnUnsupported;
++}
++
++IOReturn AliothSurfaceUserClient::sLog(IOExternalMethodArguments *args)
++{
++    return kIOReturnUnsupported;
++}
++
++IOReturn AliothSurfaceUserClient::sSetBulkAttachments(IOExternalMethodArguments *args)
++{
++    return kIOReturnUnsupported;
++}
++
++IOReturn AliothSurfaceUserClient::sLookupFromMachPort(IOExternalMethodArguments *args)
++{
++    return kIOReturnUnsupported;
++}
++
++IOReturn AliothSurfaceUserClient::sCreateMachPort(IOExternalMethodArguments *args)
++{
++    return kIOReturnUnsupported;
++}
++
++// --- Trap implementations ---
++
++IOReturn AliothSurfaceUserClient::tIncUseCount(IOExternalTrap *trap, UInt32 index, void *arg0, void *arg1, void *arg2, void *arg3)
++{
++    return kIOReturnSuccess;
++}
++
++IOReturn AliothSurfaceUserClient::tDecUseCount(IOExternalTrap *trap, UInt32 index, void *arg0, void *arg1, void *arg2, void *arg3)
++{
++    return kIOReturnSuccess;
++}
++
++IOReturn AliothSurfaceUserClient::tLock(IOExternalTrap *trap, UInt32 index, void *arg0, void *arg1, void *arg2, void *arg3)
++{
++    return kIOReturnSuccess;
++}
++
++IOReturn AliothSurfaceUserClient::tUnlock(IOExternalTrap *trap, UInt32 index, void *arg0, void *arg1, void *arg2, void *arg3)
++{
++    return kIOReturnSuccess;
++}
++
++IOReturn AliothSurfaceUserClient::tRelease(IOExternalTrap *trap, UInt32 index, void *arg0, void *arg1, void *arg2, void *arg3)
++{
++    return kIOReturnSuccess;
++}
++
++IOReturn AliothSurfaceUserClient::tReleaseFailed(IOExternalTrap *trap, UInt32 index, void *arg0, void *arg1, void *arg2, void *arg3)
++{
++    return kIOReturnSuccess;
++}
++#endif /* ARM64_BOARD_CONFIG_ALIOTH */

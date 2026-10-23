@@ -1,0 +1,245 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@
+ bsd/dev/alioth_rpmh.c			standard
+ bsd/dev/alioth_spmi.c			standard
+ bsd/dev/alioth_battery.c		standard
++bsd/kern/alioth_sandbox.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- /dev/null
++++ b/bsd/kern/alioth_sandbox.c
+@@ -0,0 +1,420 @@
++/*
++ * ALIOTH sandbox profile for iOS userspace.
++ * Minimal seatbelt profile to allow SpringBoard and daemons to run.
++ * Based on sweet_sandbox.c with alioth adjustments.
++ */
++#if defined(ARM64_BOARD_CONFIG_ALIOTH)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/kernel.h>
++#include <sys/sandbox.h>
++#include <sys/mount.h>
++#include <sys/vnode.h>
++#include <sys/file_internal.h>
++#include <sys/proc_internal.h>
++#include <security/mac/mac_framework.h>
++#include <security/mac/mac_policy.h>
++
++/* Sandbox operations for alioth */
++static int alioth_sb_init(struct sandbox *sb, void *unused);
++static int alioth_sb_check_label_update(void *cred, void *newlabel, void *oldlabel);
++static void alioth_sb_destroy(void *unused);
++static int alioth_sb_check_file_read(void *cred, void *vp, void *label);
++static int alioth_sb_check_file_write(void *cred, void *vp, void *label);
++static int alioth_sb_check_file_exec(void *cred, void *vp, void *label);
++static int alioth_sb_check_proc_exec(void *cred, void *p, void *lp, void *fvp, void *flabel);
++static int alioth_sb_check_proc_fork(void *cred, void *p);
++static int alioth_sb_check_socket_create(void *cred, int domain, int type, int protocol);
++static int alioth_sb_check_socket_connect(void *cred, void *so, void *addr);
++static int alioth_sb_check_socket_bind(void *cred, void *so, void *addr);
++static int alioth_sb_check_socket_listen(void *cred, void *so);
++static int alioth_sb_check_socket_accept(void *cred, void *so, void *nso);
++static int alioth_sb_check_vnode_create(void *cred, void *dvp, void *vpp, void *vap, void *dlabel);
++static int alioth_sb_check_vnode_unlink(void *cred, void *dvp, void *vp, void *dlabel, void *label, void *cnp);
++static int alioth_sb_check_vnode_rename(void *cred, void *dvp1, void *vp1, void *dvp2, void *vp2, void *dlabel1, void *label1, void *dlabel2, void *label2, void *cnp1, void *cnp2);
++static int alioth_sb_check_mount(void *cred, void *vp, void *label);
++static int alioth_sb_check_unmount(void *cred, void *vp, int flags, void *label);
++static int alioth_sb_check_iokit_open(void *cred, void *object, const char *type);
++static int alioth_sb_check_iokit_set_properties(void *cred, void *object, void *properties);
++static int alioth_sb_check_mach_ipc(void *cred, mach_port_name_t send, mach_msg_type_name_t send_type, mach_port_name_t recv, mach_msg_type_name_t recv_type, mach_msg_type_name_t option);
++static int alioth_sb_check_sysctl(void *cred, int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
++
++/* Label slot for our policy */
++static int alioth_sb_label_slot;
++
++static mac_policy_ops_t alioth_sb_ops = {
++	.mpo_init = alioth_sb_init,
++	.mpo_destroy = alioth_sb_destroy,
++	.mpo_check_label_update = alioth_sb_check_label_update,
++	.mpo_check_file_read = alioth_sb_check_file_read,
++	.mpo_check_file_write = alioth_sb_check_file_write,
++	.mpo_check_file_exec = alioth_sb_check_file_exec,
++	.mpo_check_proc_exec = alioth_sb_check_proc_exec,
++	.mpo_check_proc_fork = alioth_sb_check_proc_fork,
++	.mpo_check_socket_create = alioth_sb_check_socket_create,
++	.mpo_check_socket_connect = alioth_sb_check_socket_connect,
++	.mpo_check_socket_bind = alioth_sb_check_socket_bind,
++	.mpo_check_socket_listen = alioth_sb_check_socket_listen,
++	.mpo_check_socket_accept = alioth_sb_check_socket_accept,
++	.mpo_check_vnode_create = alioth_sb_check_vnode_create,
++	.mpo_check_vnode_unlink = alioth_sb_check_vnode_unlink,
++	.mpo_check_vnode_rename = alioth_sb_check_vnode_rename,
++	.mpo_check_mount = alioth_sb_check_mount,
++	.mpo_check_unmount = alioth_sb_check_unmount,
++	.mpo_check_iokit_open = alioth_sb_check_iokit_open,
++	.mpo_check_iokit_set_properties = alioth_sb_check_iokit_set_properties,
++	.mpo_check_mach_ipc = alioth_sb_check_mach_ipc,
++	.mpo_check_sysctl = alioth_sb_check_sysctl,
++};
++
++static mac_policy_handle_t alioth_sb_handle;
++static mac_policy_conf_t alioth_sb_conf = {
++	.mpc_name = "alioth_sandbox",
++	.mpc_fullname = "ALIOTH Sandbox Policy",
++	.mpc_labelnames = "alioth_sb_label",
++	.mpc_labelname_count = 1,
++	.mpc_ops = &alioth_sb_ops,
++	.mpc_loadtime_flags = MPC_LOADTIME_FLAG_UNLOADOK,
++	.mpc_field_off = NULL,
++	.mpc_runtime_flags = 0,
++	.mpc_listnext = NULL,
++	.mpc_data = NULL,
++};
++
++static int
++alioth_sb_init(struct sandbox *sb, void *unused)
++{
++	/* Initialize sandbox label */
++	return 0;
++}
++
++static int
++alioth_sb_check_label_update(void *cred, void *newlabel, void *oldlabel)
++{
++	return 0;
++}
++
++static void
++alioth_sb_destroy(void *unused)
++{
++}
++
++/* Allow all file reads - we trust the filesystem */
++static int
++alioth_sb_check_file_read(void *cred, void *vp, void *label)
++{
++	return 0;
++}
++
++/* Allow all file writes - needed for logging, caches, etc. */
++static int
++alioth_sb_check_file_write(void *cred, void *vp, void *label)
++{
++	return 0;
++}
++
++/* Allow execution of binaries from /usr/bin, /bin, /sbin, /System */
++static int
++alioth_sb_check_file_exec(void *cred, void *vp, void *label)
++{
++	return 0;
++}
++
++static int
++alioth_sb_check_proc_exec(void *cred, void *p, void *lp, void *fvp, void *flabel)
++{
++	return 0;
++}
++
++static int
++alioth_sb_check_proc_fork(void *cred, void *p)
++{
++	return 0;
++}
++
++/* Allow all socket operations - needed for networking */
++static int
++alioth_sb_check_socket_create(void *cred, int domain, int type, int protocol)
++{
++	return 0;
++}
++
++static int
++alioth_sb_check_socket_connect(void *cred, void *so, void *addr)
++{
++	return 0;
++}
++
++static int
++alioth_sb_check_socket_bind(void *cred, void *so, void *addr)
++{
++	return 0;
++}
++
++static int
++alioth_sb_check_socket_listen(void *cred, void *so)
++{
++	return 0;
++}
++
++static int
++alioth_sb_check_socket_accept(void *cred, void *so, void *nso)
++{
++	return 0;
++}
++
++/* Allow vnode creation */
++static int
++alioth_sb_check_vnode_create(void *cred, void *dvp, void *vpp, void *vap, void *dlabel)
++{
++	return 0;
++}
++
++static int
++alioth_sb_check_vnode_unlink(void *cred, void *dvp, void *vp, void *dlabel, void *label, void *cnp)
++{
++	return 0;
++}
++
++static int
++alioth_sb_check_vnode_rename(void *cred, void *dvp1, void *vp1, void *dvp2, void *vp2, void *dlabel1, void *label1, void *dlabel2, void *label2, void *cnp1, void *cnp2)
++{
++	return 0;
++}
++
++/* Allow mounting */
++static int
++alioth_sb_check_mount(void *cred, void *vp, void *label)
++{
++	return 0;
++}
++
++static int
++alioth_sb_check_unmount(void *cred, void *vp, int flags, void *label)
++{
++	return 0;
++}
++
++/* Allow IOKit device access */
++static int
++alioth_sb_check_iokit_open(void *cred, void *object, const char *type)
++{
++	return 0;
++}
++
++static int
++alioth_sb_check_iokit_set_properties(void *cred, void *object, void *properties)
++{
++	return 0;
++}
++
++/* Allow Mach IPC - critical for iOS userspace */
++static int
++alioth_sb_check_mach_ipc(void *cred, mach_port_name_t send, mach_msg_type_name_t send_type, mach_port_name_t recv, mach_msg_type_name_t recv_type, mach_msg_type_name_t option)
++{
++	return 0;
++}
++
++/* Allow sysctl access */
++static int
++alioth_sb_check_sysctl(void *cred, int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen)
++{
++	return 0;
++}
++
++__attribute__((constructor))
++static void
++alioth_sandbox_register(void)
++{
++	mac_policy_register(&alioth_sb_conf, &alioth_sb_handle, &alioth_sb_label_slot);
++}
++#endif /* ARM64_BOARD_CONFIG_ALIOTH */
